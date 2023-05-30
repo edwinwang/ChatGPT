@@ -52,27 +52,29 @@ def logger(is_timed: bool):
     """
 
     def decorator(func):
-        wraps(func)
-
+        @wraps(func)
         def wrapper(*args, **kwargs):
-            log.debug(
-                "Entering %s with args %s and kwargs %s",
-                func.__name__,
-                args,
-                kwargs,
-            )
+            # log.debug(
+            #     "Entering %s with args %s and kwargs %s",
+            #     func.__name__,
+            #     args,
+            #     kwargs,
+            # )
+            log.debug("Enter>>> %s.", func.__name__)
             start = time.time()
             out = func(*args, **kwargs)
             end = time.time()
             if is_timed:
-                log.debug(
-                    "Exiting %s with return value %s. Took %s seconds.",
-                    func.__name__,
-                    out,
-                    end - start,
-                )
+                # log.debug(
+                #     "Exiting %s with return value %s. Took %s seconds.",
+                #     func.__name__,
+                #     out,
+                #     end - start,
+                # )
+                log.debug("Exiting<<< %s. Took %s seconds.", func.__name__, end - start)
             else:
-                log.debug("Exiting %s with return value %s", func.__name__, out)
+                # log.debug("Exiting %s with return value %s", func.__name__, out)
+                log.debug("Exiting<<< %s.", func.__name__)
             return out
 
         return wrapper
@@ -358,7 +360,7 @@ class Chatbot:
         self.parent_id_prev_queue.append(pid)
 
         conversation_stream = self.handle_conversation_stream(step=1)
-
+        t1 = time.time()
         with open(conversation_stream.name, "wb") as response_file:
             response = self.session.post(
                 url=f"{self.base_url}conversation",
@@ -367,6 +369,7 @@ class Chatbot:
                 impersonate="safari15_5",
                 content_callback=response_file.write,  # a hack around curl_cffi not supporting stream=True
             )
+        log.info("Request conversation took %.2f seconds", time.time() - t1)
         self.__check_response(response)
 
         finish_details = None
@@ -445,7 +448,7 @@ class Chatbot:
         for i in self.continue_write(
             conversation_id=cid,
             timeout=timeout,
-            auto_continue=False,
+            auto_continue=True,
         ):
             i["message"] = message + i["message"]
             yield i
@@ -671,7 +674,6 @@ class Chatbot:
             auto_continue=auto_continue,
         )
 
-    @logger(is_timed=False)
     def __check_fields(self, data: dict) -> bool:
         try:
             data["message"]["content"]
@@ -827,7 +829,7 @@ class Chatbot:
         )
         self.__check_response(response)
 
-    @logger(is_timed=False)
+    @logger(is_timed=True)
     def handle_conversation_stream(self, file=None, step: int = 1):
         if step == 1:
             return tempfile.NamedTemporaryFile(delete=False)
@@ -954,7 +956,7 @@ class AsyncChatbot(Chatbot):
             return
         async for msg in self.continue_write(
             conversation_id=cid,
-            auto_continue=False,
+            auto_continue=True,
             timeout=timeout,
         ):
             msg["message"] = message + msg["message"]
