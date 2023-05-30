@@ -120,17 +120,20 @@ class Chatbot:
         Raises:
             Exception: _description_
         """
-        user_home = getenv("HOME")
-        if user_home is None:
-            user_home = Path().cwd()
-            self.cache_path = Path(Path().cwd(), ".chatgpt_cache.json")
+        if 'cache_path' in config:
+            self.cache_path = Path(config['cache_path'])
         else:
-            # mkdir ~/.config/revChatGPT
-            if not Path(user_home, ".config").exists():
-                Path(user_home, ".config").mkdir()
-            if not Path(user_home, ".config", "revChatGPT").exists():
-                Path(user_home, ".config", "revChatGPT").mkdir()
-            self.cache_path = Path(user_home, ".config", "revChatGPT", "cache.json")
+            user_home = getenv("HOME")
+            if user_home is None:
+                user_home = Path().cwd()
+                self.cache_path = Path(Path().cwd(), ".chatgpt_cache.json")
+            else:
+                # mkdir ~/.config/revChatGPT
+                if not Path(user_home, ".config").exists():
+                    Path(user_home, ".config").mkdir()
+                if not Path(user_home, ".config", "revChatGPT").exists():
+                    Path(user_home, ".config", "revChatGPT").mkdir()
+                self.cache_path = Path(user_home, ".config", "revChatGPT", "cache.json")
 
         self.config = config
         self.session = requests.Session()
