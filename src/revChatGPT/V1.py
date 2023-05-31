@@ -174,7 +174,7 @@ class Chatbot:
         self.__check_credentials()
         # Check if chat.openai.com is reachable
         if not base_url:
-            response = self.session.get(
+            response = self.do_get(
                 "https://chat.openai.com/backend-api/accounts/check",
                 impersonate="safari15_5",
             )
@@ -343,6 +343,24 @@ class Chatbot:
 
         self.set_access_token(auth.auth())
 
+    def do_post(self, *args, **kwargs):
+        log.info("Sending the payload %s", kwargs.get('url', ''))
+        resp = self.session.post(*args, **kwargs)
+        log.info("Received the response %s", resp.status_code)
+        return resp
+
+    def do_get(self, *args, **kwargs):
+        log.info("Sending the payload %s", args[0])
+        resp = self.session.get(*args, **kwargs)
+        log.info("Received the response %s", resp.status_code)
+        return resp
+    
+    def do_patch(self, *args, **kwargs):
+        log.info("Sending the payload %s", args[0])
+        resp = self.session.patch(*args, **kwargs)
+        log.info("Received the response %s", resp.status_code)
+        return resp
+
     @logger(is_timed=True)
     def __send_request(
         self,
@@ -362,14 +380,14 @@ class Chatbot:
         conversation_stream = self.handle_conversation_stream(step=1)
         t1 = time.time()
         with open(conversation_stream.name, "wb") as response_file:
-            response = self.session.post(
+            response = self.do_post(
                 url=f"{self.base_url}conversation",
                 data=json.dumps(data),
                 timeout=timeout,
                 impersonate="safari15_5",
                 content_callback=response_file.write,  # a hack around curl_cffi not supporting stream=True
             )
-        log.info("Request conversation took %.2f seconds", time.time() - t1)
+        log.info("Request conversation %s took %.2f seconds. Action %s", cid, time.time() - t1, data["action"])
         self.__check_response(response)
 
         finish_details = None
@@ -712,7 +730,7 @@ class Chatbot:
         :param limit: Integer
         """
         url = f"{self.base_url}conversations?offset={offset}&limit={limit}"
-        response = self.session.get(url, impersonate="safari15_5")
+        response = self.do_get(url, impersonate="safari15_5")
         self.__check_response(response)
         if encoding is not None:
             response.encoding = encoding
@@ -727,7 +745,7 @@ class Chatbot:
         :param encoding: String
         """
         url = f"{self.base_url}conversation/{convo_id}"
-        response = self.session.get(url, impersonate="safari15_5")
+        response = self.do_get(url, impersonate="safari15_5")
         self.__check_response(response)
         if encoding is not None:
             response.encoding = encoding
@@ -738,8 +756,8 @@ class Chatbot:
         """
         Generate title for conversation
         """
-        response = self.session.post(
-            f"{self.base_url}conversation/gen_title/{convo_id}",
+        response = self.do_post(
+            url=f"{self.base_url}conversation/gen_title/{convo_id}",
             data=json.dumps(
                 {"message_id": message_id, "model": "text-davinci-002-render"},
             ),
@@ -756,7 +774,7 @@ class Chatbot:
         :param title: String
         """
         url = f"{self.base_url}conversation/{convo_id}"
-        response = self.session.patch(
+        response = self.do_patch(
             url, data=json.dumps({"title": title}), impersonate="safari15_5"
         )
         self.__check_response(response)
@@ -768,7 +786,7 @@ class Chatbot:
         :param id: UUID of conversation
         """
         url = f"{self.base_url}conversation/{convo_id}"
-        response = self.session.patch(
+        response = self.do_patch(
             url, data='{"is_visible": false}', impersonate="safari15_5"
         )
         self.__check_response(response)
@@ -779,7 +797,7 @@ class Chatbot:
         Delete all conversations
         """
         url = f"{self.base_url}conversations"
-        response = self.session.patch(
+        response = self.do_patch(
             url, data='{"is_visible": false}', impersonate="safari15_5"
         )
         self.__check_response(response)
@@ -815,7 +833,7 @@ class Chatbot:
     @logger(is_timed=True)
     def get_plugins(self, offset: int = 0, limit: int = 250, status: str = "approved"):
         url = f"{self.base_url}aip/p?offset={offset}&limit={limit}&statuses={status}"
-        response = self.session.get(url, impersonate="safari15_5")
+        response = self.do_get(url, impersonate="safari15_5")
         self.__check_response(response)
         # Parse as JSON
         return json.loads(response.text)
@@ -824,7 +842,7 @@ class Chatbot:
     def install_plugin(self, plugin_id: str):
         url = f"{self.base_url}aip/p/{plugin_id}/user-settings"
         payload = {"is_installed": True}
-        response = self.session.patch(
+        response = self.do_patch(
             url, data=json.dumps(payload), impersonate="safari15_5"
         )
         self.__check_response(response)
