@@ -9,7 +9,6 @@ import contextlib
 import datetime
 import json
 import logging
-import tempfile
 import time
 import uuid
 from functools import wraps
@@ -21,14 +20,12 @@ from typing import Generator
 from typing import NoReturn
 
 import httpx
-from curl_cffi import requests
+import requests
+from httpx import AsyncClient
 from OpenAIAuth import Auth0 as Authenticator
 
 from . import __version__
 from . import typings as t
-from .recipient import PythonRecipient
-from .recipient import Recipient
-from .recipient import RecipientManager
 from .utils import create_completer
 from .utils import create_session
 from .utils import get_input
@@ -82,9 +79,7 @@ def logger(is_timed: bool):
     return decorator
 
 
-BASE_URL = (
-    environ.get("CHATGPT_BASE_URL") or "https://bypass.churchless.tech/"
-)  # "https://chat.openai.com/backend-api/"
+BASE_URL = environ.get("CHATGPT_BASE_URL") or "https://bypass.churchless.tech/"
 
 bcolors = t.Colors()
 
@@ -93,8 +88,6 @@ class Chatbot:
     """
     Chatbot class for ChatGPT
     """
-
-    recipients: RecipientManager
 
     @logger(is_timed=True)
     def __init__(
@@ -118,6 +111,7 @@ class Chatbot:
                 More details on these are available at https://github.com/acheong08/ChatGPT#configuration
             conversation_id (str | None, optional): Id of the conversation to continue on. Defaults to None.
             parent_id (str | None, optional): Id of the previous response message to continue on. Defaults to None.
+            session_client (_type_, optional): _description_. Defaults to None.
 
         Raises:
             Exception: _description_
@@ -139,7 +133,6 @@ class Chatbot:
 
         self.config = config
         self.session = requests.Session()
-
         if "email" in config and "password" in config:
             try:
                 cached_access_token = self.__get_cached_access_token(
@@ -160,7 +153,14 @@ class Chatbot:
                 "http": config["proxy"],
                 "https": config["proxy"],
             }
-            self.session.proxies.update(proxies)
+            if isinstance(self.session, AsyncClient):
+                proxies = {
+                    "http://": config["proxy"],
+                    "https://": config["proxy"],
+                }
+                self.session = AsyncClient(proxies=proxies)  # type: ignore
+            else:
+                self.session.proxies.update(proxies)
 
         self.conversation_id = conversation_id or config.get("conversation_id", None)
         self.parent_id = parent_id or config.get("parent_id", None)
@@ -168,26 +168,10 @@ class Chatbot:
         self.conversation_id_prev_queue = []
         self.parent_id_prev_queue = []
         self.lazy_loading = lazy_loading
-        self.recipients = RecipientManager()
+        self.base_url = base_url or BASE_URL
         self.disable_history = config.get("disable_history", False)
 
         self.__check_credentials()
-        # Check if chat.openai.com is reachable
-        if not base_url:
-            response = self.do_get(
-                "https://chat.openai.com/backend-api/accounts/check",
-                impersonate="safari15_5",
-            )
-            if response.status_code != 200:
-                print(
-                    f"Using bypass.churchless.tech backend due to status code {response.status_code}"
-                )
-                self.base_url = BASE_URL
-            else:
-                print("Using chat.openai.com backend")
-                self.base_url = "https://chat.openai.com/backend-api/"
-        else:
-            self.base_url = base_url
 
     @logger(is_timed=True)
     def __check_credentials(self) -> None:
@@ -377,24 +361,21 @@ class Chatbot:
         self.conversation_id_prev_queue.append(cid)
         self.parent_id_prev_queue.append(pid)
 
-        conversation_stream = self.handle_conversation_stream(step=1)
         t1 = time.time()
-        with open(conversation_stream.name, "wb") as response_file:
-            response = self.do_post(
-                url=f"{self.base_url}conversation",
-                data=json.dumps(data),
-                timeout=timeout,
-                impersonate="safari15_5",
-                content_callback=response_file.write,  # a hack around curl_cffi not supporting stream=True
-            )
+        response = self.session.post(
+            url=f"{self.base_url}conversation",
+            data=json.dumps(data),
+            timeout=timeout,
+            stream=True,
+        )
         log.info("Request conversation %s took %.2f seconds. Action %s", cid, time.time() - t1, data["action"])
+
         self.__check_response(response)
 
         finish_details = None
-
-        response_lst = self.handle_conversation_stream(file=conversation_stream, step=2)
-
-        for line in response_lst:
+        for line in response.iter_lines():
+            # remove b' and ' at the beginning and end and ignore case
+            line = str(line)[2:-1]
             if line.lower() == "internal server error":
                 log.error(f"Internal Server Error: {line}")
                 error = t.Error(
@@ -410,12 +391,10 @@ class Chatbot:
             if line == "[DONE]":
                 break
 
-            """
-            # this seems to just cut off parts of some messages
+            # DO NOT REMOVE THIS
             line = line.replace('\\"', '"')
             line = line.replace("\\'", "'")
             line = line.replace("\\\\", "\\")
-            """
 
             try:
                 line = json.loads(line)
@@ -709,13 +688,15 @@ class Chatbot:
         Raises:
             Error: _description_
         """
-        if response.status_code != 200:
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as ex:
             error = t.Error(
                 source="OpenAI",
                 message=response.text,
                 code=response.status_code,
             )
-            raise error
+            raise error from ex
 
     @logger(is_timed=True)
     def get_conversations(
@@ -730,7 +711,7 @@ class Chatbot:
         :param limit: Integer
         """
         url = f"{self.base_url}conversations?offset={offset}&limit={limit}"
-        response = self.do_get(url, impersonate="safari15_5")
+        response = self.do_get(url)
         self.__check_response(response)
         if encoding is not None:
             response.encoding = encoding
@@ -745,7 +726,7 @@ class Chatbot:
         :param encoding: String
         """
         url = f"{self.base_url}conversation/{convo_id}"
-        response = self.do_get(url, impersonate="safari15_5")
+        response = self.do_get(url)
         self.__check_response(response)
         if encoding is not None:
             response.encoding = encoding
@@ -761,7 +742,6 @@ class Chatbot:
             data=json.dumps(
                 {"message_id": message_id, "model": "text-davinci-002-render"},
             ),
-            impersonate="safari15_5",
         )
         self.__check_response(response)
         return response.json().get("title", "Error generating title")
@@ -774,9 +754,7 @@ class Chatbot:
         :param title: String
         """
         url = f"{self.base_url}conversation/{convo_id}"
-        response = self.do_patch(
-            url, data=json.dumps({"title": title}), impersonate="safari15_5"
-        )
+        response = self.do_patch(url, data=json.dumps({"title": title}))
         self.__check_response(response)
 
     @logger(is_timed=True)
@@ -786,9 +764,7 @@ class Chatbot:
         :param id: UUID of conversation
         """
         url = f"{self.base_url}conversation/{convo_id}"
-        response = self.do_patch(
-            url, data='{"is_visible": false}', impersonate="safari15_5"
-        )
+        response = self.do_patch(url, data='{"is_visible": false}')
         self.__check_response(response)
 
     @logger(is_timed=True)
@@ -797,9 +773,7 @@ class Chatbot:
         Delete all conversations
         """
         url = f"{self.base_url}conversations"
-        response = self.do_patch(
-            url, data='{"is_visible": false}', impersonate="safari15_5"
-        )
+        response = self.do_patch(url, data='{"is_visible": false}')
         self.__check_response(response)
 
     @logger(is_timed=False)
@@ -833,7 +807,7 @@ class Chatbot:
     @logger(is_timed=True)
     def get_plugins(self, offset: int = 0, limit: int = 250, status: str = "approved"):
         url = f"{self.base_url}aip/p?offset={offset}&limit={limit}&statuses={status}"
-        response = self.do_get(url, impersonate="safari15_5")
+        response = self.do_get(url)
         self.__check_response(response)
         # Parse as JSON
         return json.loads(response.text)
@@ -842,22 +816,9 @@ class Chatbot:
     def install_plugin(self, plugin_id: str):
         url = f"{self.base_url}aip/p/{plugin_id}/user-settings"
         payload = {"is_installed": True}
-        response = self.do_patch(
-            url, data=json.dumps(payload), impersonate="safari15_5"
-        )
+
+        response = self.do_patch(url, data=json.dumps(payload))
         self.__check_response(response)
-
-    @logger(is_timed=True)
-    def handle_conversation_stream(self, file=None, step: int = 1):
-        if step == 1:
-            return tempfile.NamedTemporaryFile(delete=False)
-        elif step == 2 and file:
-            with open(file.name) as response_file:
-                response_lst = response_file.read().splitlines()
-            file.close()
-            Path(file.name).unlink()
-            return response_lst
-
 
 class AsyncChatbot(Chatbot):
     """Async Chatbot class for ChatGPT"""
@@ -898,33 +859,14 @@ class AsyncChatbot(Chatbot):
 
         finish_details = None
         response = None
-
-        conversation_stream = self.handle_conversation_stream(step=1)
-
-        async with self.session as s:
-            with open(conversation_stream.name, "wb") as response_file:
-                response = await s.post(
-                    url=f"{self.base_url}conversation",
-                    data=json.dumps(data),
-                    timeout=timeout,
-                    impersonate="safari15_5",
-                    content_callback=response_file.write,
-                )
+        async with self.session.stream(
+            method="POST",
+            url=f"{self.base_url}conversation",
+            data=json.dumps(data),
+            timeout=timeout,
+        ) as response:
             await self.__check_response(response)
-
-            response_lst = self.handle_conversation_stream(
-                file=conversation_stream, step=2
-            )
-
-            for line in response_lst:
-                if line.lower() == "internal server error":
-                    log.error(f"Internal Server Error: {line}")
-                    error = t.Error(
-                        source="ask",
-                        message="Internal Server Error",
-                        code=t.ErrorType.SERVER_ERROR,
-                    )
-                    raise error
+            async for line in response.aiter_lines():
                 if not line or line is None:
                     continue
                 if "data: " in line:
@@ -932,12 +874,10 @@ class AsyncChatbot(Chatbot):
                 if "[DONE]" in line:
                     break
 
-                """
-                # this seems to just cut off parts of some messages
+                # DO NOT REMOVE THIS
                 line = line.replace('\\"', '"')
                 line = line.replace("\\'", "'")
                 line = line.replace("\\\\", "\\")
-                """
 
                 try:
                     line = json.loads(line)
@@ -952,9 +892,23 @@ class AsyncChatbot(Chatbot):
                 cid = line["conversation_id"]
                 pid = line["message"]["id"]
                 metadata = line["message"].get("metadata", {})
+                message_exists = False
+                author = {}
+                if line.get("message"):
+                    author = metadata.get("author", {}) or line["message"].get(
+                        "author", {}
+                    )
+                    if line["message"].get("content"):
+                        if line["message"]["content"].get("parts"):
+                            if len(line["message"]["content"]["parts"]) > 0:
+                                message_exists = True
+                message: str = (
+                    line["message"]["content"]["parts"][0] if message_exists else ""
+                )
                 model = metadata.get("model_slug", None)
                 finish_details = metadata.get("finish_details", {"type": None})["type"]
                 yield {
+                    "author": author,
                     "message": message,
                     "conversation_id": cid,
                     "parent_id": pid,
@@ -962,6 +916,7 @@ class AsyncChatbot(Chatbot):
                     "finish_details": finish_details,
                     "end_turn": line["message"].get("end_turn", True),
                     "recipient": line["message"].get("recipient", "all"),
+                    "citations": metadata.get("citations", []),
                 }
 
             self.conversation_mapping[cid] = pid
@@ -985,6 +940,7 @@ class AsyncChatbot(Chatbot):
         messages: list[dict],
         conversation_id: str | None = None,
         parent_id: str = "",
+        plugin_ids: list = [],
         model: str = "",
         auto_continue: bool = False,
         timeout: int = 360,
@@ -1048,6 +1004,9 @@ class AsyncChatbot(Chatbot):
             ),
             "history_and_training_disabled": self.disable_history,
         }
+        plugin_ids = self.config.get("plugin_ids", []) or plugin_ids
+        if len(plugin_ids) > 0 and not conversation_id:
+            data["plugin_ids"] = plugin_ids
 
         async for msg in self.__send_request(
             data=data,
@@ -1062,8 +1021,10 @@ class AsyncChatbot(Chatbot):
         conversation_id: str | None = None,
         parent_id: str = "",
         model: str = "",
+        plugin_ids: list = [],
         auto_continue: bool = False,
         timeout: int = 360,
+        **kwargs,
     ) -> AsyncGenerator[dict, None]:
         """Ask a question to the chatbot
 
@@ -1100,6 +1061,7 @@ class AsyncChatbot(Chatbot):
             messages=messages,
             conversation_id=conversation_id,
             parent_id=parent_id,
+            plugin_ids=plugin_ids,
             model=model,
             auto_continue=auto_continue,
             timeout=timeout,
@@ -1186,7 +1148,7 @@ class AsyncChatbot(Chatbot):
         :param limit: Integer
         """
         url = f"{self.base_url}conversations?offset={offset}&limit={limit}"
-        response = await self.session.get(url, impersonate="safari15_5")
+        response = await self.session.get(url)
         await self.__check_response(response)
         data = json.loads(response.text)
         return data["items"]
@@ -1201,7 +1163,7 @@ class AsyncChatbot(Chatbot):
         :param id: UUID of conversation
         """
         url = f"{self.base_url}conversation/{convo_id}"
-        response = await self.session.get(url, impersonate="safari15_5")
+        response = await self.session.get(url)
         if encoding is not None:
             response.encoding = encoding
             await self.__check_response(response)
@@ -1218,7 +1180,6 @@ class AsyncChatbot(Chatbot):
             data=json.dumps(
                 {"message_id": message_id, "model": "text-davinci-002-render"},
             ),
-            impersonate="safari15_5",
         )
         await self.__check_response(response)
 
@@ -1229,9 +1190,7 @@ class AsyncChatbot(Chatbot):
         :param title: String
         """
         url = f"{self.base_url}conversation/{convo_id}"
-        response = await self.session.patch(
-            url, data=f'{{"title": "{title}"}}', impersonate="safari15_5"
-        )
+        response = await self.session.patch(url, data=f'{{"title": "{title}"}}')
         await self.__check_response(response)
 
     async def delete_conversation(self, convo_id: str) -> None:
@@ -1240,9 +1199,7 @@ class AsyncChatbot(Chatbot):
         :param convo_id: UUID of conversation
         """
         url = f"{self.base_url}conversation/{convo_id}"
-        response = await self.session.patch(
-            url, data='{"is_visible": false}', impersonate="safari15_5"
-        )
+        response = await self.session.patch(url, data='{"is_visible": false}')
         await self.__check_response(response)
 
     async def clear_conversations(self) -> None:
@@ -1250,9 +1207,7 @@ class AsyncChatbot(Chatbot):
         Delete all conversations
         """
         url = f"{self.base_url}conversations"
-        response = await self.session.patch(
-            url, data='{"is_visible": false}', impersonate="safari15_5"
-        )
+        response = await self.session.patch(url, data='{"is_visible": false}')
         await self.__check_response(response)
 
     async def __map_conversations(self) -> None:
@@ -1317,8 +1272,6 @@ def main(config: dict) -> NoReturn:
         conversation_id=config.get("conversation_id"),
         parent_id=config.get("parent_id"),
     )
-    plugins: dict[str, Recipient] = {}
-    chatbot.recipients["python"] = PythonRecipient
 
     def handle_commands(command: str) -> bool:
         if command == "!help":
@@ -1372,28 +1325,9 @@ def main(config: dict) -> NoReturn:
                 prev_text = data["message"]
             print(bcolors.ENDC)
             print()
-        elif command == "!plugins":
-            print("Plugins:")
-            for plugin, docs in chatbot.recipients.available_recipients.items():
-                print(" [x] " if plugin in plugins else " [ ] ", plugin, ": ", docs)
-            print()
-        elif command.startswith("!switch"):
-            try:
-                plugin = command.split(" ")[1]
-                if plugin in plugins:
-                    del plugins[plugin]
-                else:
-                    plugins[plugin] = chatbot.recipients[plugin]()
-                print(
-                    f"Plugin {plugin} has been "
-                    + ("enabled" if plugin in plugins else "disabled"),
-                )
-                print()
-            except IndexError:
-                log.exception("Please include plugin name in command")
-                print("Please include plugin name in command")
         elif command == "!exit":
-            chatbot.session.close()
+            if isinstance(chatbot.session, httpx.AsyncClient):
+                chatbot.session.aclose()
             exit()
         else:
             return False
@@ -1415,51 +1349,20 @@ def main(config: dict) -> NoReturn:
     )
     print()
     try:
-        msg = {}
         result = {}
-        times = 0
         while True:
-            if not msg:
-                times = 0
-                print(f"{bcolors.OKBLUE + bcolors.BOLD}You: {bcolors.ENDC}")
+            print(f"{bcolors.OKBLUE + bcolors.BOLD}You: {bcolors.ENDC}")
 
-                prompt = get_input(session=session, completer=completer)
-                if prompt.startswith("!") and handle_commands(prompt):
-                    continue
-                if not chatbot.conversation_id and plugins:
-                    prompt = (
-                        (
-                            f"""You are ChatGPT.
-
-Knowledge cutoff: 2021-09
-Current date: {datetime.datetime.now().strftime("%Y-%m-%d")}
-
-###Available Tools:
-"""
-                            + ";".join(plugins)
-                            + "\n\n"
-                            + "\n\n".join([i.API_DOCS for i in plugins.values()])
-                        )
-                        + "\n\n\n\n"
-                        + prompt
-                    )
-                msg = {
-                    "id": str(uuid.uuid4()),
-                    "author": {"role": "user"},
-                    "content": {"content_type": "text", "parts": [prompt]},
-                }
-            else:
-                print(
-                    f"{bcolors.OKCYAN + bcolors.BOLD}{result['recipient'] if result['recipient'] != 'user' else 'You'}: {bcolors.ENDC}",
-                )
-                print(msg["content"]["parts"][0])
+            prompt = get_input(session=session, completer=completer)
+            if prompt.startswith("!") and handle_commands(prompt):
+                continue
 
             print()
             print(f"{bcolors.OKGREEN + bcolors.BOLD}Chatbot: {bcolors.ENDC}")
             if chatbot.config.get("model") == "gpt-4-browsing":
                 print("Browsing takes a while, please wait...")
             prev_text = ""
-            for data in chatbot.post_messages([msg], auto_continue=True):
+            for data in chatbot.ask(prompt=prompt, auto_continue=True):
                 if data["recipient"] != "all":
                     continue
                 result = data
@@ -1478,24 +1381,6 @@ Current date: {datetime.datetime.now().strftime("%Y-%m-%d")}
                         f'{citation["metadata"]["title"]}: {citation["metadata"]["url"]}',
                     )
                 print()
-
-            msg = {}
-            if not result.get("end_turn", True):
-                times += 1
-                if times >= 5:
-                    continue
-                api = plugins.get(result["recipient"])
-                if not api:
-                    msg = {
-                        "id": str(uuid.uuid4()),
-                        "author": {"role": "user"},
-                        "content": {
-                            "content_type": "text",
-                            "parts": [f"Error: No plugin {result['recipient']} found"],
-                        },
-                    }
-                    continue
-                msg = api.process(result)
 
     except (KeyboardInterrupt, EOFError):
         exit()
