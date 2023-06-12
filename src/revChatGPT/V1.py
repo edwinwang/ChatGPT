@@ -118,7 +118,7 @@ class Chatbot:
         if 'cache_path' in config:
             self.cache_path = Path(config['cache_path'])
         else:
-            user_home = getenv("HOME")
+            user_home = getenv("HOME") or getenv("USERPROFILE")
             if user_home is None:
                 user_home = Path().cwd()
                 self.cache_path = Path(Path().cwd(), ".chatgpt_cache.json")
@@ -503,16 +503,21 @@ class Chatbot:
                         "Conversation ID %s not found in conversation mapping, try to get conversation history for the given ID",
                         conversation_id,
                     )
-                    with contextlib.suppress(Exception):
+                    try:
                         history = self.get_msg_history(conversation_id)
                         self.conversation_mapping[conversation_id] = history[
                             "current_node"
                         ]
+                    except requests.exceptions.HTTPError:
+                        print("Conversation unavailable")
                 else:
                     self.__map_conversations()
             if conversation_id in self.conversation_mapping:
                 parent_id = self.conversation_mapping[conversation_id]
-            else:  # invalid conversation_id provided, treat as a new conversation
+            else:
+                print(
+                    "Warning: Invalid conversation_id provided, treat as a new conversation",
+                )
                 conversation_id = None
                 parent_id = str(uuid.uuid4())
 
@@ -729,7 +734,54 @@ class Chatbot:
         self.__check_response(response)
         if encoding is not None:
             response.encoding = encoding
-        return json.loads(response.text)
+        return response.json()
+
+    def share_conversation(
+        self,
+        title: str = None,
+        convo_id: str = None,
+        node_id: str = None,
+        anonymous: bool = True,
+    ) -> str:
+        """
+        Creates a share link to a conversation
+        :param convo_id: UUID of conversation
+        :param node_id: UUID of node
+
+        Returns:
+            str: A URL to the shared link
+        """
+        convo_id = convo_id or self.conversation_id
+        node_id = node_id or self.parent_id
+        headers = {
+            "Content-Type": "application/json",
+            "origin": "https://chat.openai.com",
+            "referer": f"https://chat.openai.com/c/{convo_id}",
+        }
+        # First create the share
+        payload = {
+            "conversation_id": convo_id,
+            "current_node_id": node_id,
+            "is_anonymous": anonymous,
+        }
+        url = f"{self.base_url}share/create"
+        response = self.session.post(url, data=json.dumps(payload), headers=headers)
+        self.__check_response(response)
+        share_url = response.json().get("share_url")
+        # Then patch the share to make public
+        share_id = response.json().get("share_id")
+        url = f"{self.base_url}share/{share_id}"
+        payload = {
+            "share_id": share_id,
+            "highlighted_message_id": node_id,
+            "title": title or response.json().get("title", "New chat"),
+            "is_public": True,
+            "is_visible": True,
+            "is_anonymous": True,
+        }
+        response = self.session.patch(url, data=json.dumps(payload), headers=headers)
+        self.__check_response(response)
+        return share_url
 
     @logger(is_timed=True)
     def gen_title(self, convo_id: str, message_id: str) -> str:
@@ -826,8 +878,9 @@ class AsyncChatbot(Chatbot):
         self,
         config: dict,
         conversation_id: str | None = None,
-        parent_id: str = "",
-        base_url: str = "",
+        parent_id: str | None = None,
+        base_url: str | None = None,
+        lazy_loading: bool = True,
     ) -> None:
         """
         Same as Chatbot class, but with async methods.
@@ -837,6 +890,7 @@ class AsyncChatbot(Chatbot):
             conversation_id=conversation_id,
             parent_id=parent_id,
             base_url=base_url,
+            lazy_loading=lazy_loading,
         )
 
         # overwrite inherited normal session with async
@@ -847,34 +901,39 @@ class AsyncChatbot(Chatbot):
         data: dict,
         auto_continue: bool = False,
         timeout: float = 360,
+        **kwargs,
     ) -> AsyncGenerator[dict, None]:
+        log.debug("Sending the payload")
+
         cid, pid = data["conversation_id"], data["parent_message_id"]
+        model, message = None, ""
 
         self.conversation_id_prev_queue.append(cid)
         self.parent_id_prev_queue.append(pid)
-        message = ""
-
-        finish_details = None
-        response = None
         async with self.session.stream(
-            method="POST",
+            "POST",
             url=f"{self.base_url}conversation",
             data=json.dumps(data),
             timeout=timeout,
         ) as response:
             await self.__check_response(response)
+
+            finish_details = None
             async for line in response.aiter_lines():
+                if line.lower() == "internal server error":
+                    log.error(f"Internal Server Error: {line}")
+                    error = t.Error(
+                        source="ask",
+                        message="Internal Server Error",
+                        code=t.ErrorType.SERVER_ERROR,
+                    )
+                    raise error
                 if not line or line is None:
                     continue
                 if "data: " in line:
                     line = line[6:]
-                if "[DONE]" in line:
+                if line == "[DONE]":
                     break
-
-                # DO NOT REMOVE THIS
-                line = line.replace('\\"', '"')
-                line = line.replace("\\'", "'")
-                line = line.replace("\\\\", "\\")
 
                 try:
                     line = json.loads(line)
@@ -885,7 +944,6 @@ class AsyncChatbot(Chatbot):
                 if line.get("message").get("author").get("role") != "assistant":
                     continue
 
-                message: str = line["message"]["content"]["parts"][0]
                 cid = line["conversation_id"]
                 pid = line["message"]["id"]
                 metadata = line["message"].get("metadata", {})
@@ -893,7 +951,8 @@ class AsyncChatbot(Chatbot):
                 author = {}
                 if line.get("message"):
                     author = metadata.get("author", {}) or line["message"].get(
-                        "author", {}
+                        "author",
+                        {},
                     )
                     if line["message"].get("content"):
                         if line["message"]["content"].get("parts"):
@@ -917,38 +976,40 @@ class AsyncChatbot(Chatbot):
                 }
 
             self.conversation_mapping[cid] = pid
-            if pid:
+            if pid is not None:
                 self.parent_id = pid
-            if cid:
+            if cid is not None:
                 self.conversation_id = cid
 
-        if not (auto_continue and finish_details == "max_tokens"):
-            return
-        async for msg in self.continue_write(
-            conversation_id=cid,
-            auto_continue=True,
-            timeout=timeout,
-        ):
-            msg["message"] = message + msg["message"]
-            yield msg
+            if not (auto_continue and finish_details == "max_tokens"):
+                return
+            message = message.strip("\n")
+            async for i in self.continue_write(
+                conversation_id=cid,
+                timeout=timeout,
+                auto_continue=True,
+            ):
+                i["message"] = message + i["message"]
+                yield i
 
     async def post_messages(
         self,
         messages: list[dict],
         conversation_id: str | None = None,
-        parent_id: str = "",
+        parent_id: str | None = None,
         plugin_ids: list = [],
-        model: str = "",
+        model: str | None = None,
         auto_continue: bool = False,
-        timeout: int = 360,
+        timeout: float = 360,
+        **kwargs,
     ) -> AsyncGenerator[dict, None]:
         """Post messages to the chatbot
 
         Args:
             messages (list[dict]): the messages to post
             conversation_id (str | None, optional): UUID for the conversation to continue on. Defaults to None.
-            parent_id (str, optional): UUID for the message to continue on. Defaults to "".
-            model (str, optional): The model to use. Defaults to "".
+            parent_id (str | None, optional): UUID for the message to continue on. Defaults to None.
+            model (str | None, optional): The model to use. Defaults to None.
             auto_continue (bool, optional): Whether to continue the conversation automatically. Defaults to False.
             timeout (float, optional): Timeout for getting the full response, unit is second. Defaults to 360.
 
@@ -962,28 +1023,45 @@ class AsyncChatbot(Chatbot):
                 "finish_details": str,
                 "end_turn": bool,
                 "recipient": str,
+                "citations": list[dict],
             }
         """
         if parent_id and not conversation_id:
-            error = t.Error(
+            raise t.Error(
                 source="User",
                 message="conversation_id must be set once parent_id is set",
-                code=t.ErrorType.SERVER_ERROR,
+                code=t.ErrorType.USER_ERROR,
             )
-            raise error
+
         if conversation_id and conversation_id != self.conversation_id:
             self.parent_id = None
         conversation_id = conversation_id or self.conversation_id
-
         parent_id = parent_id or self.parent_id or ""
         if not conversation_id and not parent_id:
             parent_id = str(uuid.uuid4())
+
         if conversation_id and not parent_id:
             if conversation_id not in self.conversation_mapping:
-                await self.__map_conversations()
+                if self.lazy_loading:
+                    log.debug(
+                        "Conversation ID %s not found in conversation mapping, try to get conversation history for the given ID",
+                        conversation_id,
+                    )
+                    try:
+                        history = await self.get_msg_history(conversation_id)
+                        self.conversation_mapping[conversation_id] = history[
+                            "current_node"
+                        ]
+                    except requests.exceptions.HTTPError:
+                        print("Conversation unavailable")
+                else:
+                    await self.__map_conversations()
             if conversation_id in self.conversation_mapping:
                 parent_id = self.conversation_mapping[conversation_id]
-            else:  # invalid conversation_id provided, treat as a new conversation
+            else:
+                print(
+                    "Warning: Invalid conversation_id provided, treat as a new conversation",
+                )
                 conversation_id = None
                 parent_id = str(uuid.uuid4())
 
@@ -992,13 +1070,7 @@ class AsyncChatbot(Chatbot):
             "messages": messages,
             "conversation_id": conversation_id,
             "parent_message_id": parent_id,
-            "model": model
-            or self.config.get("model")
-            or (
-                "text-davinci-002-render-paid"
-                if self.config.get("paid")
-                else "text-davinci-002-render-sha"
-            ),
+            "model": model or self.config.get("model") or "text-davinci-002-render-sha",
             "history_and_training_disabled": self.disable_history,
         }
         plugin_ids = self.config.get("plugin_ids", []) or plugin_ids
@@ -1006,9 +1078,9 @@ class AsyncChatbot(Chatbot):
             data["plugin_ids"] = plugin_ids
 
         async for msg in self.__send_request(
-            data=data,
-            auto_continue=auto_continue,
+            data,
             timeout=timeout,
+            auto_continue=auto_continue,
         ):
             yield msg
 
@@ -1167,6 +1239,55 @@ class AsyncChatbot(Chatbot):
             return json.loads(response.text)
         return None
 
+    async def share_conversation(
+        self,
+        title: str = None,
+        convo_id: str = None,
+        node_id: str = None,
+        anonymous: bool = True,
+    ) -> str:
+        """
+        Creates a share link to a conversation
+        :param convo_id: UUID of conversation
+        :param node_id: UUID of node
+
+        Returns:
+            str: A URL to the shared link
+        """
+        convo_id = convo_id or self.conversation_id
+        node_id = node_id or self.parent_id
+        # First create the share
+        payload = {
+            "conversation_id": convo_id,
+            "current_node_id": node_id,
+            "is_anonymous": anonymous,
+        }
+        url = f"{self.base_url}share/create"
+        response = await self.session.post(
+            url,
+            data=json.dumps(payload),
+        )
+        await self.__check_response(response)
+        share_url = response.json().get("share_url")
+        # Then patch the share to make public
+        share_id = response.json().get("share_id")
+        url = f"{self.base_url}share/{share_id}"
+        print(url)
+        payload = {
+            "share_id": share_id,
+            "highlighted_message_id": node_id,
+            "title": title or response.json().get("title", "New chat"),
+            "is_public": True,
+            "is_visible": True,
+            "is_anonymous": True,
+        }
+        response = await self.session.patch(
+            url,
+            data=json.dumps(payload),
+        )
+        await self.__check_response(response)
+        return share_url
+
     async def gen_title(self, convo_id: str, message_id: str) -> None:
         """
         Generate title for conversation
@@ -1280,6 +1401,7 @@ def main(config: dict) -> NoReturn:
             !switch x - Switch to plugin x. Need to reset the conversation to ativate the plugin.
             !rollback x - Rollback the conversation (x being the number of messages to rollback)
             !setconversation - Changes the conversation
+            !share - Creates a share link to the current conversation
             !exit - Exit this program
             """,
             )
@@ -1321,6 +1443,8 @@ def main(config: dict) -> NoReturn:
                 prev_text = data["message"]
             print(bcolors.ENDC)
             print()
+        elif command.startswith("!share"):
+            print(f"Conversation shared at {chatbot.share_conversation()}")
         elif command == "!exit":
             if isinstance(chatbot.session, httpx.AsyncClient):
                 chatbot.session.aclose()
@@ -1341,6 +1465,7 @@ def main(config: dict) -> NoReturn:
             "!continue",
             "!plugins",
             "!switch",
+            "!share",
         ],
     )
     print()
