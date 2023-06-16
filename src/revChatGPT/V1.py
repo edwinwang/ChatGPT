@@ -8,6 +8,7 @@ import binascii
 import contextlib
 import json
 import logging
+import secrets
 import time
 import uuid
 from functools import wraps
@@ -28,6 +29,32 @@ from . import typings as t
 from .utils import create_completer
 from .utils import create_session
 from .utils import get_input
+
+
+def generate_random_hex(length: int = 17) -> str:
+    """Generate a random hex string
+
+    Args:
+        length (int, optional): Length of the hex string. Defaults to 17.
+
+    Returns:
+        str: Random hex string
+    """
+    return secrets.token_hex(length)
+
+
+def random_int(min: int, max: int) -> int:
+    """Generate a random integer
+
+    Args:
+        min (int): Minimum value
+        max (int): Maximum value
+
+    Returns:
+        int: Random integer
+    """
+    return secrets.randbelow(max - min) + min
+
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -171,6 +198,19 @@ class Chatbot:
         self.disable_history = config.get("disable_history", False)
 
         self.__check_credentials()
+
+        if self.config.get("PUID"):
+            self.session.cookies.set("_puid", self.config["PUID"])
+
+        if self.config.get("plugin_ids", []):
+            for plugin in self.config.get("plugin_ids"):
+                self.install_plugin(plugin)
+        if self.config.get("unverified_plugin_domains", []):
+            for domain in self.config.get("unverified_plugin_domains"):
+                if self.config.get("plugin_ids"):
+                    self.config["plugin_ids"].append(self.get_unverified_plugin(domain,install=True).get("id"))
+                else:
+                    self.config["plugin_ids"] = [self.get_unverified_plugin(domain,install=True).get("id")]
 
     @logger(is_timed=True)
     def __check_credentials(self) -> None:
@@ -520,15 +560,19 @@ class Chatbot:
                 )
                 conversation_id = None
                 parent_id = str(uuid.uuid4())
-
+        model = model or self.config.get("model") or "text-davinci-002-render-sha"
         data = {
             "action": "next",
             "messages": messages,
             "conversation_id": conversation_id,
             "parent_message_id": parent_id,
-            "model": model or self.config.get("model") or "text-davinci-002-render-sha",
+            "model": model,
             "history_and_training_disabled": self.disable_history,
         }
+        if model.startswith("gpt-4"):
+            data[
+                "arkose_token"
+            ] = f"{generate_random_hex()}|r=ap-southeast-1|meta=3|meta_width=300|metabgclr=transparent|metaiconclr=%23555555|guitextcolor=%23000000|pk=35536E1E-65B4-4D96-9D97-6ADB7EFF8147|at=40|sup=1|rid={random_int(1,99)}|ag=101|cdn_url=https%3A%2F%2Ftcr9i.chat.openai.com%2Fcdn%2Ffc|lurl=https%3A%2F%2Faudio-ap-southeast-1.arkoselabs.com|surl=https%3A%2F%2Ftcr9i.chat.openai.com|smurl=https%3A%2F%2Ftcr9i.chat.openai.com%2Fcdn%2Ffc%2Fassets%2Fstyle-manager"
         plugin_ids = self.config.get("plugin_ids", []) or plugin_ids
         if len(plugin_ids) > 0 and not conversation_id:
             data["plugin_ids"] = plugin_ids
@@ -654,7 +698,7 @@ class Chatbot:
             else:  # invalid conversation_id provided, treat as a new conversation
                 conversation_id = None
                 parent_id = str(uuid.uuid4())
-
+        model = model or self.config.get("model") or "text-davinci-002-render-sha"
         data = {
             "action": "continue",
             "conversation_id": conversation_id,
@@ -668,6 +712,10 @@ class Chatbot:
             ),
             "history_and_training_disabled": self.disable_history,
         }
+        if model.startswith("gpt-4"):
+            data[
+                "arkose_token"
+            ] = f"{generate_random_hex()}|r=ap-southeast-1|meta=3|meta_width=300|metabgclr=transparent|metaiconclr=%23555555|guitextcolor=%23000000|pk=35536E1E-65B4-4D96-9D97-6ADB7EFF8147|at=40|sup=1|rid={random_int(1,99)}|ag=101|cdn_url=https%3A%2F%2Ftcr9i.chat.openai.com%2Fcdn%2Ffc|lurl=https%3A%2F%2Faudio-ap-southeast-1.arkoselabs.com|surl=https%3A%2F%2Ftcr9i.chat.openai.com|smurl=https%3A%2F%2Ftcr9i.chat.openai.com%2Fcdn%2Ffc%2Fassets%2Fstyle-manager"
 
         yield from self.__send_request(
             data,
@@ -747,6 +795,8 @@ class Chatbot:
         Creates a share link to a conversation
         :param convo_id: UUID of conversation
         :param node_id: UUID of node
+        :param anonymous: Boolean
+        :param title: String
 
         Returns:
             str: A URL to the shared link
@@ -787,6 +837,8 @@ class Chatbot:
     def gen_title(self, convo_id: str, message_id: str) -> str:
         """
         Generate title for conversation
+        :param id: UUID of conversation
+        :param message_id: UUID of message
         """
         response = self.do_post(
             url=f"{self.base_url}conversation/gen_title/{convo_id}",
@@ -857,6 +909,12 @@ class Chatbot:
 
     @logger(is_timed=True)
     def get_plugins(self, offset: int = 0, limit: int = 250, status: str = "approved"):
+        """
+        Get plugins
+        :param offset: Integer. Offset (Only supports 0)
+        :param limit: Integer. Limit (Only below 250)
+        :param status: String. Status of plugin (approved)
+        """
         url = f"{self.base_url}aip/p?offset={offset}&limit={limit}&statuses={status}"
         response = self.do_get(url)
         self.__check_response(response)
@@ -865,11 +923,30 @@ class Chatbot:
 
     @logger(is_timed=True)
     def install_plugin(self, plugin_id: str):
+        """
+        Install plugin by ID
+        :param plugin_id: String. ID of plugin
+        """
         url = f"{self.base_url}aip/p/{plugin_id}/user-settings"
         payload = {"is_installed": True}
 
         response = self.do_patch(url, data=json.dumps(payload))
         self.__check_response(response)
+
+    @logger(is_timed=True)
+    def get_unverified_plugin(self, domain: str, install: bool = True) -> dict:
+        """
+        Get unverified plugin by domain
+        :param domain: String. Domain of plugin
+        :param install: Boolean. Install plugin if found
+        """
+        url = f"{self.base_url}aip/p/domain?domain={domain}"
+        response = self.do_get(url)
+        self.__check_response(response)
+        if install:
+            self.install_plugin(response.json().get("id"))
+        return response.json()
+
 
 class AsyncChatbot(Chatbot):
     """Async Chatbot class for ChatGPT"""
@@ -1064,19 +1141,22 @@ class AsyncChatbot(Chatbot):
                 )
                 conversation_id = None
                 parent_id = str(uuid.uuid4())
-
+        model = model or self.config.get("model") or "text-davinci-002-render-sha"
         data = {
             "action": "next",
             "messages": messages,
             "conversation_id": conversation_id,
             "parent_message_id": parent_id,
-            "model": model or self.config.get("model") or "text-davinci-002-render-sha",
+            "model": model,
             "history_and_training_disabled": self.disable_history,
         }
         plugin_ids = self.config.get("plugin_ids", []) or plugin_ids
         if len(plugin_ids) > 0 and not conversation_id:
             data["plugin_ids"] = plugin_ids
-
+        if model.startswith("gpt-4"):
+            data[
+                "arkose_token"
+            ] = f"{generate_random_hex()}|r=ap-southeast-1|meta=3|meta_width=300|metabgclr=transparent|metaiconclr=%23555555|guitextcolor=%23000000|pk=35536E1E-65B4-4D96-9D97-6ADB7EFF8147|at=40|sup=1|rid={random_int(1,99)}|ag=101|cdn_url=https%3A%2F%2Ftcr9i.chat.openai.com%2Fcdn%2Ffc|lurl=https%3A%2F%2Faudio-ap-southeast-1.arkoselabs.com|surl=https%3A%2F%2Ftcr9i.chat.openai.com|smurl=https%3A%2F%2Ftcr9i.chat.openai.com%2Fcdn%2Ffc%2Fassets%2Fstyle-manager"
         async for msg in self.__send_request(
             data,
             timeout=timeout,
@@ -1188,7 +1268,7 @@ class AsyncChatbot(Chatbot):
             else:  # invalid conversation_id provided, treat as a new conversation
                 conversation_id = None
                 parent_id = str(uuid.uuid4())
-
+        model = model or self.config.get("model") or "text-davinci-002-render-sha"
         data = {
             "action": "continue",
             "conversation_id": conversation_id,
@@ -1202,6 +1282,10 @@ class AsyncChatbot(Chatbot):
             ),
             "history_and_training_disabled": self.disable_history,
         }
+        if model.startswith("gpt-4"):
+            data[
+                "arkose_token"
+            ] = f"{generate_random_hex()}|r=ap-southeast-1|meta=3|meta_width=300|metabgclr=transparent|metaiconclr=%23555555|guitextcolor=%23000000|pk=35536E1E-65B4-4D96-9D97-6ADB7EFF8147|at=40|sup=1|rid={random_int(1,99)}|ag=101|cdn_url=https%3A%2F%2Ftcr9i.chat.openai.com%2Fcdn%2Ffc|lurl=https%3A%2F%2Faudio-ap-southeast-1.arkoselabs.com|surl=https%3A%2F%2Ftcr9i.chat.openai.com|smurl=https%3A%2F%2Ftcr9i.chat.openai.com%2Fcdn%2Ffc%2Fassets%2Fstyle-manager"
 
         async for msg in self.__send_request(
             data=data,
