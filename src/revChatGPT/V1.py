@@ -212,6 +212,9 @@ class Chatbot:
                 else:
                     self.config["plugin_ids"] = [self.get_unverified_plugin(domain,install=True).get("id")]
 
+        # login retry
+        self.login_retry = 0
+
     @logger(is_timed=True)
     def __check_credentials(self) -> None:
         """Check login info and perform login
@@ -231,9 +234,10 @@ class Chatbot:
             raise error
         if "access_token" not in self.config:
             try:
+                self.login_retry += 1
                 self.login()
             except Exception as error:
-                print(error)
+                self.login_retry = 0
                 raise error
 
     @logger(is_timed=False)
@@ -350,6 +354,14 @@ class Chatbot:
             cached = {}
         return cached
 
+    @logger(is_timed=False)
+    def __check_token(self):
+        try:
+            if "access_token" not in self.config:
+                self.__check_credentials()
+        except Exception as e:
+            log.error(f"Token error {e}")
+
     @logger(is_timed=True)
     def login(self) -> None:
         """Login to OpenAI by email and password"""
@@ -366,23 +378,43 @@ class Chatbot:
 
         self.set_access_token(auth.auth())
 
-    def do_post(self, *args, **kwargs):
+
+    def request(self, method: str, *args, **kwargs):
+        """Send request to OpenAI API
+        Returns:
+            _type_: _response_
+        """
+        self.__check_token()
         log.info("Sending the payload %s", kwargs.get('url', ''))
-        resp = self.session.post(*args, **kwargs)
+        resp = self.session.request(method, *args, **kwargs)
         log.info("Received the response %s", resp.status_code)
         return resp
 
+
+    def do_post(self, *args, **kwargs):
+        """Send post request to OpenAI API
+        Returns:
+            _type_: _response_
+        """
+        return self.request("POST", *args, **kwargs)
+
+
     def do_get(self, *args, **kwargs):
-        log.info("Sending the payload %s", args[0])
-        resp = self.session.get(*args, **kwargs)
-        log.info("Received the response %s", resp.status_code)
-        return resp
-    
+        """Send get request to OpenAI API
+
+        Returns:
+            _type_: _response_
+        """
+        return self.request("GET", *args, **kwargs)
+
+
     def do_patch(self, *args, **kwargs):
-        log.info("Sending the payload %s", args[0])
-        resp = self.session.patch(*args, **kwargs)
-        log.info("Received the response %s", resp.status_code)
-        return resp
+        """Send patch request to OpenAI API
+
+        Returns:
+            _type_: _response_
+        """
+        return self.request("PATCH", *args, **kwargs)
 
     @logger(is_timed=True)
     def __send_request(
@@ -400,8 +432,7 @@ class Chatbot:
         self.conversation_id_prev_queue.append(cid)
         self.parent_id_prev_queue.append(pid)
 
-        t1 = time.time()
-        response = self.session.post(
+        response = self.do_post(
             url=f"{self.base_url}conversation",
             data=json.dumps(data),
             timeout=timeout,
@@ -741,6 +772,8 @@ class Chatbot:
             Error: _description_
         """
         try:
+            if response.status_code == 401:
+                self.config["access_token"] = None
             response.raise_for_status()
         except requests.exceptions.HTTPError as ex:
             error = t.Error(
