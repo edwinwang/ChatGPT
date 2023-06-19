@@ -197,6 +197,10 @@ class Chatbot:
         self.base_url = base_url or BASE_URL
         self.disable_history = config.get("disable_history", False)
 
+        # login retry
+        self.login_retry = 0
+        self.avaiable = True
+
         self.__check_credentials()
 
         if self.config.get("PUID"):
@@ -212,8 +216,6 @@ class Chatbot:
                 else:
                     self.config["plugin_ids"] = [self.get_unverified_plugin(domain,install=True).get("id")]
 
-        # login retry
-        self.login_retry = 0
 
     @logger(is_timed=True)
     def __check_credentials(self) -> None:
@@ -234,10 +236,13 @@ class Chatbot:
             raise error
         if "access_token" not in self.config:
             try:
+                if self.login_retry > 3:
+                    self.avaiable = False
+                    raise t.AuthenticationError("Too many login attempts")
                 self.login_retry += 1
                 self.login()
-            except Exception as error:
                 self.login_retry = 0
+            except Exception as error:
                 raise error
 
     @logger(is_timed=False)
