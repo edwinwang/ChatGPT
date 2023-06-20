@@ -436,7 +436,7 @@ class Chatbot:
 
         self.conversation_id_prev_queue.append(cid)
         self.parent_id_prev_queue.append(pid)
-
+        t1 = time.time()
         response = self.do_post(
             url=f"{self.base_url}conversation",
             data=json.dumps(data),
