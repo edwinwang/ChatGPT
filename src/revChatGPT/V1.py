@@ -21,6 +21,7 @@ from typing import NoReturn
 
 import httpx
 import requests
+import tls_client
 from httpx import AsyncClient
 from OpenAIAuth import Auth0 as Authenticator
 from rich.live import Live
@@ -110,6 +111,35 @@ def logger(is_timed: bool):
 BASE_URL = environ.get("CHATGPT_BASE_URL") or "https://bypass.churchless.tech/"
 
 bcolors = t.Colors()
+
+session = tls_client.Session(
+    client_identifier="firefox110", random_tls_extension_order=True
+)
+
+
+def get_arkose_token() -> str:
+    form_data = session.get(BASE_URL + "arkose").json().get("form")
+    resp: dict = session.post(
+        "https://tcr9i.chat.openai.com/fc/gt2/public_key/35536E1E-65B4-4D96-9D97-6ADB7EFF8147",
+        data=form_data,
+        headers={
+            "Host": "tcr9i.chat.openai.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:114.0) Gecko/20100101 Firefox/114.0",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://tcr9i.chat.openai.com",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Referer": "https://tcr9i.chat.openai.com/v2/1.5.2/enforcement.64b3a4e29686f93d52816249ecbf9857.html",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "TE": "trailers",
+        },
+    ).json()
+    return resp.get("token")
 
 
 class Chatbot:
@@ -205,9 +235,6 @@ class Chatbot:
 
         self.__check_credentials()
 
-        if self.config.get("PUID"):
-            self.session.cookies.set("_puid", self.config["PUID"])
-
         if self.config.get("plugin_ids", []):
             for plugin in self.config.get("plugin_ids"):
                 self.install_plugin(plugin)
@@ -218,7 +245,18 @@ class Chatbot:
                         self.get_unverified_plugin(domain, install=True).get("id"),
                     )
                 else:
-                    self.config["plugin_ids"] = [self.get_unverified_plugin(domain,install=True).get("id")]
+                    self.config["plugin_ids"] = [
+                        self.get_unverified_plugin(domain, install=True).get("id"),
+                    ]
+        # Get PUID cookie
+        try:
+            auth = Authenticator("blah", "blah")
+            auth.access_token = self.config["access_token"]
+            puid = auth.get_puid()
+            self.session.headers.update({"PUID": puid})
+            print("Setting PUID (You are a Plus user!): " + puid)
+        except:
+            pass
 
     @logger(is_timed=True)
     def __check_credentials(self) -> None:
@@ -384,19 +422,7 @@ class Chatbot:
         )
         log.debug("Using authenticator to get access token")
 
-        self.set_access_token(auth.auth())
-
-    def __arkose_token(self) -> str:
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-        }
-        form_data = "public_key=35536E1E-65B4-4D96-9D97-6ADB7EFF8147&site=https%3A%2F%2Fchat.openai.com&userbrowser=Mozilla%2F5.0%20(X11%3B%20Linux%20x86_64)%20AppleWebKit%2F537.36%20(KHTML%2C%20like%20Gecko)%20Chrome%2F114.0.0.0%20Safari%2F537.36&capi_version=1.5.2&capi_mode=lightbox&style_theme=default&rnd=0.3649022041957759"
-        url = "https://tcr9i.chat.openai.com/fc/gt2/public_key/35536E1E-65B4-4D96-9D97-6ADB7EFF8147"
-        response = self.do_post(url, data=form_data, headers=headers)
-        self.__check_response(response)
-        return response.json()["token"]
+        self.set_access_token(auth.get_access_token())
 
 
     def request(self, method: str, *args, **kwargs):
@@ -446,11 +472,18 @@ class Chatbot:
     ) -> Generator[dict, None, None]:
         log.debug("Sending the payload")
 
+        if (
+            data.get("model", "").startswith("gpt-4")
+            and not self.config.get("SERVER_SIDE_ARKOSE")
+            and not getenv("SERVER_SIDE_ARKOSE")
+        ):
+            try:
+                data["arkose_token"] = get_arkose_token()
+            except:
+                pass
+
         cid, pid = data["conversation_id"], data["parent_message_id"]
         message = ""
-
-        if data.get("model", "").startswith("gpt-4"):
-            data["arkose_token"] = self.__arkose_token()
 
         self.conversation_id_prev_queue.append(cid)
         self.parent_id_prev_queue.append(pid)
@@ -1021,18 +1054,6 @@ class AsyncChatbot(Chatbot):
         # overwrite inherited normal session with async
         self.session = AsyncClient(headers=self.session.headers)
 
-    async def __arkose_token(self) -> str:
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-        }
-        form_data = "public_key=35536E1E-65B4-4D96-9D97-6ADB7EFF8147&site=https%3A%2F%2Fchat.openai.com&userbrowser=Mozilla%2F5.0%20(X11%3B%20Linux%20x86_64)%20AppleWebKit%2F537.36%20(KHTML%2C%20like%20Gecko)%20Chrome%2F114.0.0.0%20Safari%2F537.36&capi_version=1.5.2&capi_mode=lightbox&style_theme=default&rnd=0.3649022041957759"
-        url = "https://tcr9i.chat.openai.com/fc/gt2/public_key/35536E1E-65B4-4D96-9D97-6ADB7EFF8147"
-        response = await self.session.post(url, data=form_data, headers=headers)
-        self.__check_response(response)
-        return response.json()["token"]
-
     async def __send_request(
         self,
         data: dict,
@@ -1044,8 +1065,6 @@ class AsyncChatbot(Chatbot):
 
         cid, pid = data["conversation_id"], data["parent_message_id"]
         message = ""
-        if data.get("model", "").startswith("gpt-4"):
-            data["arkose_token"] = await self.__arkose_token()
         self.conversation_id_prev_queue.append(cid)
         self.parent_id_prev_queue.append(pid)
         async with self.session.stream(
